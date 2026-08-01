@@ -135,6 +135,11 @@ class A2CBase(BaseAlgorithm):
             self.env_info = self.vec_env.get_env_info()
         else:
             self.vec_env = config.get('vec_env', None)
+        build_representation_config = getattr(self.vec_env, 'representation_run_config', None)
+        if build_representation_config is not None:
+            representation_config = build_representation_config()
+            if representation_config and wandb.run is not None:
+                wandb.config.update({'action_bench_representation': representation_config})
 
         self.ppo_device = config.get('device', 'cuda:0')
         self.value_size = self.env_info.get('value_size',1)
@@ -1472,6 +1477,13 @@ class ContinuousA2CBase(A2CBase):
                     if self.save_freq > 0:
                         if epoch_num % self.save_freq == 0:
                             self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+                        if epoch_num % 100 == 0:  # rolling latest, ~20 min at study throughput
+                            latest_dir = os.path.join(self.experiment_dir, 'last')
+                            torch_ext.safe_filesystem_op(os.makedirs, latest_dir, exist_ok=True)
+                            latest_path = os.path.join(latest_dir, 'model.pth')
+                            if os.path.exists(latest_path):
+                                os.replace(latest_path, latest_path + '.old')
+                            self.save(os.path.join(latest_dir, 'model'))
 
                     if mean_rewards[0] > self.last_mean_rewards + 1.0 and epoch_num >= self.save_best_after:
                         # NEW: only save after a margin   
@@ -1486,6 +1498,10 @@ class ContinuousA2CBase(A2CBase):
                                 print('Maximum reward achieved. Network won!')
                                 self.save(os.path.join(self.nn_dir, checkpoint_name))
                                 should_exit = True
+                flush_action_metrics = getattr(self.vec_env, 'flush_action_metrics', None)
+                if flush_action_metrics is not None:
+                    for key, value in flush_action_metrics().items():
+                        tolog[key] = wandb.Histogram(np_histogram=value) if isinstance(value, tuple) else value
                 # print(f"wandb logging: {tolog}")
                 wandb.log(tolog)
                 if epoch_num >= self.max_epochs and self.max_epochs != -1:
