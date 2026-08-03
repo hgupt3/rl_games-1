@@ -1553,17 +1553,10 @@ class ContinuousA2CBase(A2CBase):
                     print('MAX EPOCHS NUM!')
                     should_exit = True
                 
-                # add an early stop if reward is too low:
-                if epoch_num > 2500 and (not uenv.use_curriculum):
-                    if self.game_rewards.current_size == 0:
-                        print('WARNING: No rewards recorded')
-                        mean_rewards = -np.inf
-                        should_exit = True
-                    elif mean_rewards[0] < 35:
-                        print('Reward too low, stopping')
-                        should_exit = True
-                        self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_ep_' + str(epoch_num) \
-                            + '_rew_' + str(mean_rewards).replace('[', '_').replace(']', '_')))
+                # NOTE(action-bench): upstream stopped non-curriculum runs with
+                # mean reward < 35 after epoch 2500. That threshold assumes the
+                # full-method reward scale and killed entire objdex studies, so
+                # the guard is removed; budgets and owners stop runs instead.
                 # also early stop if gains are 0:
                 if uenv.use_curriculum and uenv.curriculum.num_epoch_since_zero > 1500:
                     print('Curriculum zero gains for 1500 epochs now, stopping')
