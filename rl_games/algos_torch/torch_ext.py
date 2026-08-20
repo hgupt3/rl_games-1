@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -69,7 +70,12 @@ def safe_filesystem_op(func, *args, **kwargs):
     raise RuntimeError(f'Could not execute {func}, give up after {num_attempts} attempts...')
 
 def safe_save(state, filename):
-    return safe_filesystem_op(torch.save, state, filename)
+    # Atomic save: serialize to a scratch file in the same directory, then
+    # os.replace it onto the final name so a torn write can never leave a
+    # truncated checkpoint at the destination path.
+    tmp_filename = str(filename) + '.tmp'
+    safe_filesystem_op(torch.save, state, tmp_filename)
+    return safe_filesystem_op(os.replace, tmp_filename, filename)
 
 def safe_load(filename):
     return safe_filesystem_op(torch.load, filename)

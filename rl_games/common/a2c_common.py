@@ -1,5 +1,6 @@
 import copy
 import os
+import signal
 
 from rl_games.common import vecenv
 
@@ -645,17 +646,89 @@ class A2CBase(BaseAlgorithm):
             )
 
         if now >= self._next_rolling_checkpoint_time:
-            latest_dir = os.path.join(self.experiment_dir, 'last')
-            torch_ext.safe_filesystem_op(os.makedirs, latest_dir, exist_ok=True)
-            latest_path = os.path.join(latest_dir, 'model.pth')
-            if os.path.exists(latest_path):
-                os.replace(latest_path, latest_path + '.old')
-            self.save(os.path.join(latest_dir, 'model'))
+            self._save_rolling_checkpoint()
             self._next_rolling_checkpoint_time = self._advance_checkpoint_time(
                 self._next_rolling_checkpoint_time,
                 now,
                 ROLLING_CHECKPOINT_INTERVAL_SECONDS,
             )
+
+    def _save_rolling_checkpoint(self):
+        # Materialize the new checkpoint under a scratch name first, then
+        # rotate model.pth -> model.pth.old, then move the new file into
+        # place, so a complete rolling checkpoint (model.pth or
+        # model.pth.old) exists on disk at every point in the sequence.
+        latest_dir = os.path.join(self.experiment_dir, 'last')
+        torch_ext.safe_filesystem_op(os.makedirs, latest_dir, exist_ok=True)
+        latest_path = os.path.join(latest_dir, 'model.pth')
+        staging_base = os.path.join(latest_dir, 'model_next')
+        self.save(staging_base)
+        if os.path.exists(latest_path):
+            os.replace(latest_path, latest_path + '.old')
+        os.replace(staging_base + '.pth', latest_path)
+
+    def _install_exit_signal_handlers(self):
+        self._exit_signal = None
+        self._exit_checkpoint_saved = False
+        self._previous_signal_handlers = {}
+
+        def _request_exit(signum, frame):
+            if self._exit_signal is None:
+                self._exit_signal = signum
+                print('Received signal {}: will save a checkpoint and exit '
+                      'at the next epoch boundary'.format(signum))
+                # A repeated signal falls through to the previous handler.
+                previous = self._previous_signal_handlers.get(signum)
+                if previous is not None:
+                    signal.signal(signum, previous)
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                self._previous_signal_handlers[signum] = signal.signal(signum, _request_exit)
+            except (ValueError, OSError):
+                # Not in the main thread, or the signal is unavailable.
+                pass
+
+    def _restore_exit_signal_handlers(self):
+        for signum, previous in getattr(self, '_previous_signal_handlers', {}).items():
+            if previous is not None:
+                try:
+                    signal.signal(signum, previous)
+                except (ValueError, OSError):
+                    pass
+        self._previous_signal_handlers = {}
+
+    def _save_exit_checkpoint(self):
+        # Final checkpoint written when the train loop exits on SIGTERM or
+        # SIGINT: archival-style name plus a refresh of the rolling
+        # last/model.pth so resume glue picks up the newest state.
+        if getattr(self, '_exit_checkpoint_saved', False):
+            return
+        self._exit_checkpoint_saved = True
+        if self.global_rank != 0:
+            return
+        checkpoint_name = 'last_' + self.config['name'] + '_ep_' + str(self.epoch_num) \
+            + '_rew_' + str(self.mean_rewards).replace('[', '_').replace(']', '_')
+        print('Termination signal {}: saving checkpoint {}'.format(
+            self._exit_signal, checkpoint_name))
+        self.save(os.path.join(self.nn_dir, checkpoint_name))
+        self._save_rolling_checkpoint()
+
+    def save_shutdown_checkpoint(self):
+        """Best-effort rolling checkpoint for host shutdown paths.
+
+        Returns True when a checkpoint was written. No-op when the train
+        loop already wrote its exit checkpoint (clean or signal exit) or
+        training never started.
+        """
+        if getattr(self, '_exit_checkpoint_saved', False):
+            return False
+        if self.global_rank != 0:
+            return False
+        if getattr(self, 'model', None) is None:
+            return False
+        self._save_rolling_checkpoint()
+        return True
 
     def update_epoch(self):
         pass
@@ -1122,6 +1195,7 @@ class DiscreteA2CBase(A2CBase):
         self.mean_rewards = self.last_mean_rewards = -100500
         start_time = time.perf_counter()
         self._start_checkpoint_schedule()
+        self._install_exit_signal_handlers()
         total_time = 0
         rep_count = 0
         # self.frame = 0  # loading from checkpoint
@@ -1139,6 +1213,10 @@ class DiscreteA2CBase(A2CBase):
                 self.central_value_net.load_state_dict(model_params[1])
 
         while True:
+            if self._exit_signal is not None:
+                self._save_exit_checkpoint()
+                self._restore_exit_signal_handlers()
+                return self.last_mean_rewards, self.epoch_num
             epoch_num = self.update_epoch()
             step_time, play_time, update_time, sum_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
 
@@ -1238,6 +1316,8 @@ class DiscreteA2CBase(A2CBase):
                 should_exit = should_exit_t.bool().item()
 
             if should_exit:
+                self._exit_checkpoint_saved = True
+                self._restore_exit_signal_handlers()
                 return self.last_mean_rewards, epoch_num
 
 
@@ -1410,6 +1490,7 @@ class ContinuousA2CBase(A2CBase):
         self.last_mean_rewards = -100500
         start_time = time.perf_counter()
         self._start_checkpoint_schedule()
+        self._install_exit_signal_handlers()
         total_time = 0
         rep_count = 0
         self.obs = self.env_reset()
@@ -1429,6 +1510,10 @@ class ContinuousA2CBase(A2CBase):
         uenv = self.vec_env.env.unwrapped
         
         while True:
+            if self._exit_signal is not None:
+                self._save_exit_checkpoint()
+                self._restore_exit_signal_handlers()
+                return self.last_mean_rewards, self.epoch_num
             epoch_num = self.update_epoch()
             if epoch_num % self.record_freq == 0 or epoch_num == 1:
                 # print('Starting recording')
@@ -1582,7 +1667,11 @@ class ContinuousA2CBase(A2CBase):
                 dist.broadcast(should_exit_t, 0)
                 should_exit = should_exit_t.float().item()
             if should_exit:
+                self._exit_checkpoint_saved = True
+                self._restore_exit_signal_handlers()
                 return self.last_mean_rewards, epoch_num
 
             if should_exit:
+                self._exit_checkpoint_saved = True
+                self._restore_exit_signal_handlers()
                 return self.last_mean_rewards, epoch_num
