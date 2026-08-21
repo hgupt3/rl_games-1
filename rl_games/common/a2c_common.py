@@ -144,7 +144,13 @@ class A2CBase(BaseAlgorithm):
         if build_representation_config is not None:
             representation_config = build_representation_config()
             if representation_config and wandb.run is not None:
-                wandb.config.update({'action_bench_representation': representation_config})
+                # allow_val_change: on a checkpoint resume the run already
+                # carries this key, and the float32->json round trip differs
+                # in the last digits; refreshing it must not abort training.
+                wandb.config.update(
+                    {'action_bench_representation': representation_config},
+                    allow_val_change=True,
+                )
 
         self.ppo_device = config.get('device', 'cuda:0')
         self.value_size = self.env_info.get('value_size',1)
