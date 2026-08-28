@@ -327,8 +327,72 @@ class A2CBuilder(NetworkBuilder):
                 mu_init(self.mu.weight)
                 if self.fixed_sigma:
                     sigma_init(self.sigma)
+                    _add_path = self.space_config.get('noise_eigen_additive')
+                    if _add_path:
+                        # additive eigen exploration: independent per-joint iid
+                        # noise (the policy's own per-dim sigma) plus an extra
+                        # learnable-loudness term along K fixed eigen
+                        # directions. The policy has no lever for correlations
+                        # outside those K directions.
+                        #
+                        # The noise_correlation (corrlearn) and
+                        # noise_eigen_sigma (eignoise) seams are deliberately
+                        # absent on this fork, so there is no exclusivity
+                        # check to make here.
+                        import numpy as _np
+                        _z = _np.load(_add_path)
+                        _basis = _z['basis'].astype(_np.float32)
+                        if _basis.ndim != 2 or _basis.shape[1] != actions_num:
+                            raise ValueError(
+                                'noise_eigen_additive basis shape %s != (K, %d)'
+                                % (_basis.shape, actions_num))
+                        _k = _basis.shape[0]
+                        # No orthonormality requirement on this path. The
+                        # eigadd covariance Sigma = D + B^T S^2 B and its
+                        # Woodbury/determinant-lemma log-prob are exact for an
+                        # ARBITRARY B. The final-paper eig_noise bundles carry
+                        # v18 PCA directions rescaled into normalized action
+                        # units (components / joint_half_range), which are
+                        # deliberately NOT orthonormal -- non-uniform joint
+                        # half-ranges destroy the radians-space orthogonality.
+                        # Guard what actually matters instead: finiteness and
+                        # a non-degenerate (full row rank) direction set.
+                        if not _np.all(_np.isfinite(_basis)):
+                            raise ValueError(
+                                'noise_eigen_additive basis is not finite')
+                        if _np.linalg.matrix_rank(
+                                _basis.astype(_np.float64)) != _k:
+                            raise ValueError(
+                                'noise_eigen_additive basis is rank deficient '
+                                '(%d directions, rank %d)'
+                                % (_k, _np.linalg.matrix_rank(
+                                    _basis.astype(_np.float64))))
+                        _jg = _z['joint_gains'].astype(_np.float64)
+                        _eg = _z['eigen_gains'].astype(_np.float64)
+                        if _jg.shape != (actions_num,) or _np.any(_jg <= 0.0):
+                            raise ValueError(
+                                'noise_eigen_additive joint_gains invalid')
+                        if _eg.shape != (_k,) or _np.any(_eg <= 0.0):
+                            raise ValueError(
+                                'noise_eigen_additive eigen_gains invalid')
+                        self.register_buffer('noise_eigadd_basis',
+                                             torch.tensor(_basis))
+                        self.noise_eigadd_names = [
+                            str(_x) for _x in _z['names']]
+                        _s0 = float(self.space_config.get(
+                            'sigma_init', {}).get('val', 0.0))
+                        with torch.no_grad():
+                            self.sigma.add_(torch.tensor(
+                                0.5 * _np.log(_jg), dtype=self.sigma.dtype))
+                        self.noise_eigadd_logsig = nn.Parameter(
+                            torch.tensor(_s0 + 0.5 * _np.log(_eg),
+                                         dtype=torch.float32),
+                            requires_grad=True)
+                        print('[action-bench] additive eigen exploration '
+                              'active (%d iid joint dims + %d eigen dims, '
+                              'no tail lever)' % (actions_num, _k))
                 else:
-                    sigma_init(self.sigma.weight)  
+                    sigma_init(self.sigma.weight)
 
         def forward(self, obs_dict):
             obs = obs_dict['obs']

@@ -416,6 +416,31 @@ class A2CBase(BaseAlgorithm):
         }
         for k,v in self.aux_loss_dict.items():
             tolog['losses/' + k] = torch_ext.mean_list(v).item()
+        _net = getattr(self.model, 'a2c_network', None)
+        _add_names = getattr(_net, 'noise_eigadd_names', None)
+        if _add_names:
+            _ls = getattr(_net, 'noise_eigadd_logsig', None)
+            _sig = getattr(_net, 'sigma', None)
+            if _ls is not None:
+                with torch.no_grad():
+                    _s = torch.exp(_ls.detach())
+                    _sv = _s.cpu().tolist()
+                    for _n, _si in zip(_add_names, _sv):
+                        tolog['info/noise_eigadd_sigma/%s' % _n] = _si
+                    tolog['info/noise_eigadd_sigma_mean'] = \
+                        sum(_sv) / len(_sv)
+                    if isinstance(_sig, torch.Tensor):
+                        # decoded eigen-noise RMS over the n action channels:
+                        # diag(B^T S^2 B)_j = sum_k s_k^2 B[k, j]^2
+                        _B = _net.noise_eigadd_basis
+                        _diag = ((_s ** 2).unsqueeze(-1) * _B ** 2).sum(dim=0)
+                        _eig_rms = float(torch.sqrt(_diag.mean()))
+                        _jsig = torch.exp(_sig.detach()).flatten()
+                        _joint_rms = float(torch.sqrt((_jsig ** 2).mean()))
+                        tolog['info/noise_eigadd_eigen_rms'] = _eig_rms
+                        tolog['info/noise_eigadd_joint_rms'] = _joint_rms
+                        tolog['info/noise_eigadd_eigen_joint_ratio'] = \
+                            _eig_rms / _joint_rms
         # wandb.log(tolog, step=frame)
         episode_log = self.algo_observer.wandb_after_print_stats(frame, epoch_num, total_time)
         tolog.update(episode_log)
