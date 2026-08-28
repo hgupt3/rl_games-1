@@ -327,7 +327,14 @@ class A2CBuilder(NetworkBuilder):
                 mu_init(self.mu.weight)
                 if self.fixed_sigma:
                     sigma_init(self.sigma)
-                    _add_path = self.space_config.get('noise_eigen_additive')
+                    # DexMachina's launcher cannot reach into the rl_games
+                    # params dict the way the DeXtreme (hydra override) and
+                    # SimToolReal (direct mutation) launchers do, so it
+                    # delivers the bundle through the environment, mirroring
+                    # the wuji-mjlab seam. space_config still wins when set.
+                    import os as _os
+                    _add_path = self.space_config.get('noise_eigen_additive') \
+                        or _os.environ.get('ACTION_BENCH_NOISE_EIGEN_ADDITIVE')
                     if _add_path:
                         # additive eigen exploration: independent per-joint iid
                         # noise (the policy's own per-dim sigma) plus an extra
