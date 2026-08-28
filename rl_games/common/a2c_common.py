@@ -790,6 +790,10 @@ class A2CBase(BaseAlgorithm):
         state['epoch'] = self.epoch_num
         state['frame'] = self.frame
         state['optimizer'] = self.optimizer.state_dict()
+        # Adaptive-KL scheduler state: without these a warm resume restarts
+        # the LR at the config value (up to ~30x above its adapted level).
+        state['last_lr'] = self.last_lr
+        state['entropy_coef'] = self.entropy_coef
 
         if self.has_central_value:
             state['assymetric_vf_nets'] = self.central_value_net.state_dict()
@@ -815,6 +819,14 @@ class A2CBase(BaseAlgorithm):
             self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
 
         self.optimizer.load_state_dict(weights['optimizer'])
+        # Restore the adaptive-KL scheduler state; checkpoints from before the
+        # last_lr key load unchanged (LR restarts at the config value, the
+        # pre-fix behavior).
+        self.last_lr = weights.get('last_lr', self.last_lr)
+        self.entropy_coef = weights.get('entropy_coef', self.entropy_coef)
+        if 'last_lr' in weights:
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.last_lr
 
         self.last_mean_rewards = weights.get('last_mean_rewards', -1000000000)
 
