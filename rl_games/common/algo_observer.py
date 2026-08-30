@@ -3,6 +3,22 @@ import torch
 import numpy as np
 
 
+def finite_mean(values):
+    """Mean over the finite entries of a per-env diagnostic tensor.
+
+    Envs whose physics state goes NaN are already reward-patched to -1.0 and
+    force-reset by the environment, so training is unaffected by them, but the
+    diagnostic tensors handed to the logger still carry their NaN/Inf entries.
+    A plain mean lets a single such env poison the logged average of every
+    diagnostic, so the logged statistic is reduced over the finite entries
+    only. If nothing is finite the result is NaN, as before.
+    """
+    finite = values[torch.isfinite(values)]
+    if finite.numel() == 0:
+        return torch.tensor(float("nan"), device=values.device)
+    return torch.mean(finite)
+
+
 class AlgoObserver:
     def __init__(self):
         pass
@@ -129,7 +145,7 @@ class IsaacAlgoObserver(AlgoObserver):
                     if len(ep_info[key].shape) == 0:
                         ep_info[key] = ep_info[key].unsqueeze(0)
                     info_tensor = torch.cat((info_tensor, ep_info[key].to(self.algo.device)))
-                value = torch.mean(info_tensor)
+                value = finite_mean(info_tensor)
                 self.writer.add_scalar("Episode/" + key, value, epoch_num)
             self.ep_infos.clear()
         # log scalars from env information
@@ -157,7 +173,7 @@ class IsaacAlgoObserver(AlgoObserver):
                     if len(ep_info[key].shape) == 0:
                         ep_info[key] = ep_info[key].unsqueeze(0)
                     info_tensor = torch.cat((info_tensor, ep_info[key].to(self.algo.device)))
-                value = torch.mean(info_tensor)
+                value = finite_mean(info_tensor)
                 # self.writer.add_scalar("Episode/" + key, value, epoch_num)
                 tolog["Episode/" + key] = value.item()
             self.ep_infos.clear()
