@@ -324,16 +324,39 @@ class ModelA2CContinuousLogStd(BaseModel):
                 }
                 return result
 
+        def _eigadd_const_std(self, std):
+            """Row-0 view of std when the batch shares one sigma, else None.
+
+            Under fixed_sigma the log-sigma is a learnable parameter, so every
+            row of std is the same expression broadcast over the batch (the
+            builder returns mu * 0.0 + sigma_act(sigma)); the N capacitance
+            matrices are then identical and one K x K factorization serves the
+            whole batch. The check is structural -- the sigma parameter's own
+            shape, not an elementwise scan of std -- and a per-sample sigma
+            head (fixed_sigma False) falls through to the per-row path.
+            """
+            net = self.a2c_network
+            if not getattr(net, 'fixed_sigma', False):
+                return None
+            sig = getattr(net, 'sigma', None)
+            if not isinstance(sig, nn.Parameter) or sig.dim() != 1:
+                return None
+            return std.unsqueeze(0) if std.dim() == 1 else std[:1]
+
         def _eigadd_chol(self, std):
             """Cholesky of K = I + S B D^-1 B^T S for Sigma = D + B^T S^2 B.
 
             B is the (K, n) eigen direction block (arbitrary, not required to
             be orthonormal), S = diag(exp(logsig)), D = diag(std^2). K is
-            (N, K, K) when std is per-row.
+            (N, K, K) when std is per-row, and (1, K, K) when the batch is
+            sigma-constant (see _eigadd_const_std) -- same math, one factor.
             """
             net = self.a2c_network
             B8 = net.noise_eigadd_basis
             s = torch.exp(net.noise_eigadd_logsig)
+            const = self._eigadd_const_std(std)
+            if const is not None:
+                std = const
             invvar = std.pow(-2)
             if invvar.dim() == 1:
                 invvar = invvar.unsqueeze(0)
@@ -358,7 +381,12 @@ class ModelA2CContinuousLogStd(BaseModel):
             y2 = ((delta / std) ** 2).sum(dim=-1)
             w = ((delta / std.pow(2)) @ B8.t()) * s
             L = self._eigadd_chol(std)
-            t = torch.cholesky_solve(w.unsqueeze(-1), L).squeeze(-1)
+            if L.shape[0] == 1:
+                # shared factor: one multi-RHS solve instead of N of them
+                t = torch.cholesky_solve(
+                    w.reshape(-1, w.shape[-1]).t(), L[0]).t().reshape(w.shape)
+            else:
+                t = torch.cholesky_solve(w.unsqueeze(-1), L).squeeze(-1)
             logdet_k = 2.0 * torch.log(
                 torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
             return 0.5 * (y2 - (w * t).sum(dim=-1)) \
