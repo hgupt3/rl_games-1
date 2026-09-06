@@ -360,7 +360,12 @@ class ModelA2CContinuousLogStd(BaseModel):
             invvar = std.pow(-2)
             if invvar.dim() == 1:
                 invvar = invvar.unsqueeze(0)
-            G = torch.einsum('ai,ni,bi->nab', B8, invvar, B8)
+            # Batched matmul rather than a 3-operand torch.einsum: the einsum
+            # path (opt_einsum.contract_path on its first call) pinned the
+            # first-rollout call stack for the life of the process and with it
+            # one rollout of buffers (measured on the SimToolReal fork,
+            # 2026-09-06; same seam here). Same contraction, bit-identical.
+            G = torch.matmul(B8.unsqueeze(0) * invvar.unsqueeze(1), B8.t())
             K = (s.unsqueeze(-1) * s.unsqueeze(0)) * G
             K = K + torch.eye(s.numel(), device=K.device, dtype=K.dtype)
             return torch.linalg.cholesky(K)
